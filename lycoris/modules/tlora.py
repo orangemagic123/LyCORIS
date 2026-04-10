@@ -362,12 +362,70 @@ class TLoraModule(LycorisBaseModule):
         return module
 
     def custom_state_dict(self):
-        """Return state dict for saving."""
+        """Return state dict in standard LoRA format for ComfyUI compatibility.
+
+        T-LoRA's effective weight delta at inference time (with all ranks
+        active, i.e. no timestep masking) is:
+
+            ΔW = P · diag(λ) · Q - P_base · diag(λ_base) · Q_base
+
+        We express this exactly as a standard LoRA with doubled rank by
+        stacking the trained and frozen base paths:
+
+            lora_up   = [P · diag(λ), -P_base · diag(λ_base)]   shape (out, 2r)
+            lora_down = [Q ; Q_base]                            shape (2r, in)
+
+        This produces ``lora_up @ lora_down = ΔW`` exactly.  Since LyCORIS /
+        ComfyUI apply ``scale = alpha / rank`` to standard LoRA while T-LoRA
+        uses ``scale = alpha / lora_dim`` and our saved rank is ``2 * lora_dim``,
+        we scale alpha by 2 so the effective strength is preserved.
+        """
+        with torch.no_grad():
+            q = self.q_layer.weight.detach()
+            p = self.p_layer.weight.detach()
+            lam = self.lambda_layer.detach()
+            q_base = self.base_q.detach()
+            p_base = self.base_p.detach()
+            lam_base = self.base_lambda.detach()
+
+            r = self.lora_dim
+
+            if self.isconv:
+                # Reshape conv weights to 2D for the stacking math.
+                out_ch = self.shape[0]
+                q_2d = q.reshape(r, -1)
+                p_2d = p.reshape(out_ch, r)
+                q_base_2d = q_base.reshape(r, -1)
+                p_base_2d = p_base.reshape(out_ch, r)
+
+                # P · diag(λ) broadcast over columns.
+                p_scaled = p_2d * lam
+                p_base_scaled = p_base_2d * lam_base
+
+                lora_up_2d = torch.cat([p_scaled, -p_base_scaled], dim=1)
+                lora_down_2d = torch.cat([q_2d, q_base_2d], dim=0)
+
+                kernel_ones = [1] * (len(self.shape) - 2)
+                lora_up = lora_up_2d.reshape(
+                    out_ch, 2 * r, *kernel_ones
+                ).contiguous()
+                lora_down = lora_down_2d.reshape(
+                    2 * r, self.shape[1], *kernel_ones
+                ).contiguous()
+            else:
+                p_scaled = p * lam
+                p_base_scaled = p_base * lam_base
+
+                lora_up = torch.cat([p_scaled, -p_base_scaled], dim=1).contiguous()
+                lora_down = torch.cat([q, q_base], dim=0).contiguous()
+
+            # Double alpha so ``alpha / rank`` stays equal to ``alpha_t / r``.
+            new_alpha = self.alpha.detach() * 2
+
         return {
-            "q_layer.weight": self.q_layer.weight,
-            "p_layer.weight": self.p_layer.weight,
-            "lambda_layer": self.lambda_layer,
-            "alpha": self.alpha,
+            "lora_up.weight": lora_up,
+            "lora_down.weight": lora_down,
+            "alpha": new_alpha,
         }
 
     def get_diff_weight(self, multiplier=1.0, shape=None, device=None):
