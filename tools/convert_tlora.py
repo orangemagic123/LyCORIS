@@ -67,24 +67,57 @@ def _save_state_dict(sd: Dict[str, torch.Tensor], path: str) -> None:
         torch.save(sd, path)
 
 
-def _build_base_lookup(base_sd: Dict[str, torch.Tensor]) -> Dict[str, str]:
+def _build_base_lookup(
+    base_sd: Dict[str, torch.Tensor],
+    wanted_lora_names: "set[str]",
+) -> Dict[str, str]:
     """Build a map from LyCORIS lora-name to the corresponding base weight key.
 
     LyCORIS names a module by joining its dotted module path with ``_`` and
-    prefixing with e.g. ``lora_unet_``.  The reverse mapping is ambiguous
-    (module names themselves may contain ``_``), so we iterate the base state
-    dict and compute the forward mapping for each candidate weight key.
+    prefixing with e.g. ``lora_unet_``.  The base ``.safetensors`` file we are
+    handed here is usually a full checkpoint whose weight keys carry an
+    extra prefix such as ``model.diffusion_model.`` that the in-memory LyCORIS
+    module never saw — the training loop wraps a sub-module, so only its
+    ``named_modules()`` path ends up in the lora_name.
+
+    We therefore match by **suffix**: for every candidate weight key in the
+    base state dict, we take its dotted module path and progressively strip
+    leading path segments, forming candidate lora names of the form
+    ``<prefix>_<suffix_with_dots_as_underscores>``.  The first candidate
+    that appears in ``wanted_lora_names`` wins.  We prefer the longest
+    suffix (least prefix stripping) so that e.g. a module legitimately
+    named ``model_diffusion_model_blocks_0_...`` would still be preferred
+    over the truncated ``blocks_0_...`` alternative if it existed.
     """
+    # Every prefix LyCORIS can emit.  We loop over all of them because the
+    # user's checkpoint may contain multiple scopes.
+    known_prefixes = ("lora_unet", "lora_te", "lora_te1", "lora_te2")
+
     lookup: Dict[str, str] = {}
     for key in base_sd.keys():
         if not key.endswith(".weight"):
             continue
         module_path = key[: -len(".weight")]
-        # LyCORIS wraps UNet modules as "lora_unet_<dotted path with _>" by
-        # default.  Text-encoder support is not attempted here because the
-        # anima model in the issue is a transformer UNet variant.
-        lora_name = "lora_unet_" + module_path.replace(".", "_")
-        lookup[lora_name] = key
+        parts = module_path.split(".")
+
+        # Try progressively more aggressive prefix stripping: start with the
+        # full path, then drop one leading segment at a time.
+        found = False
+        for start in range(len(parts)):
+            suffix = "_".join(parts[start:])
+            for prefix in known_prefixes:
+                candidate = f"{prefix}_{suffix}"
+                if candidate in wanted_lora_names:
+                    # Prefer the first (longest) match, but don't overwrite an
+                    # existing entry that was set from an even longer suffix
+                    # for the same lora_name — that earlier entry was at least
+                    # as specific.
+                    if candidate not in lookup:
+                        lookup[candidate] = key
+                    found = True
+                    break
+            if found:
+                break
     return lookup
 
 
@@ -185,7 +218,20 @@ def convert(
             "in the input checkpoint.  Nothing to convert."
         )
 
-    base_lookup = _build_base_lookup(base_sd)
+    wanted_lora_names = set(groups.keys())
+    base_lookup = _build_base_lookup(base_sd, wanted_lora_names)
+
+    if not base_lookup:
+        sample_base = list(base_sd.keys())[:5]
+        sample_lora = list(wanted_lora_names)[:5]
+        raise RuntimeError(
+            "Could not match any T-LoRA module to a weight in the base "
+            "model.\n"
+            f"  Sample T-LoRA names: {sample_lora}\n"
+            f"  Sample base keys:    {sample_base}\n"
+            "Make sure --base-model points to the underlying anima "
+            "checkpoint, not another LoRA file."
+        )
 
     converted: Dict[str, torch.Tensor] = {}
     missing_base: list[str] = []
@@ -275,9 +321,12 @@ def convert(
             converted[k] = v
 
     if missing_base:
+        sample_base = [k for k in list(base_sd.keys())[:5] if k.endswith(".weight")]
         print(
             f"[warn] {len(missing_base)} T-LoRA modules had no matching base "
-            f"weight and were skipped. First few: {missing_base[:5]}",
+            f"weight and were skipped.\n"
+            f"        first unmatched lora names: {missing_base[:5]}\n"
+            f"        sample base weight keys:    {sample_base}",
             file=sys.stderr,
         )
     if skipped:
