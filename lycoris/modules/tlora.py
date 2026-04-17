@@ -167,6 +167,12 @@ class TLoraModule(LycorisBaseModule):
         if self.module_type not in self.support_module:
             raise ValueError(f"{self.module_type} is not supported in T-LoRA algo.")
 
+        if self.module_type.startswith("conv") and org_module.groups > 1:
+            raise ValueError(
+                "T-LoRA does not support grouped convolutions "
+                f"(got groups={org_module.groups}). Use a different algo."
+            )
+
         self.lora_dim = lora_dim
         self.sig_type = sig_type
         self.use_data_init = use_data_init
@@ -183,6 +189,17 @@ class TLoraModule(LycorisBaseModule):
             stride = org_module.stride
             padding = org_module.padding
 
+            # The 1x1 Q/P decomposition cannot exactly represent a kernel>1
+            # conv delta, so force bypass mode to keep forward correct and
+            # avoid producing silently-wrong merged weights.
+            if any(k > 1 for k in k_size) and not self.bypass_mode:
+                logger.info(
+                    "T-LoRA forcing bypass_mode for conv with kernel>1 "
+                    f"({lora_name}, k_size={tuple(k_size)}); merge/save is only "
+                    "representable via bypass-style 1x1 convs."
+                )
+                self.bypass_mode = True
+
             # For convolutions, we work with reshaped weights
             # Original weight shape: (out_channels, in_channels, *kernel_size)
             # We treat it as (out_dim, in_dim * prod(kernel_size)) for SVD
@@ -194,12 +211,17 @@ class TLoraModule(LycorisBaseModule):
             self.q_layer = self.module(in_dim, lora_dim, 1, bias=False)
             self.p_layer = self.module(lora_dim, out_dim, 1, bias=False)
 
-            # Store original conv params for the actual forward
+            # Store original conv params for the actual forward.
+            # The Q/P layers are 1x1 convs. To keep the output spatial size
+            # identical to the original kernel>1 conv with "same" padding, we
+            # drop the original padding (there is no kernel to pad around) but
+            # keep stride and dilation so output positions line up with the
+            # original kernel's center tap.
             self.down_op = self.op
             self.up_op = self.op
             self.kw_dict_down = {
                 "stride": stride,
-                "padding": padding,
+                "padding": (0,) * len(k_size),
                 "dilation": org_module.dilation,
                 "groups": org_module.groups,
             }
@@ -323,7 +345,9 @@ class TLoraModule(LycorisBaseModule):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _get_mask(self, device: torch.device) -> torch.Tensor:
+    def _get_mask(
+        self, device: torch.device, dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
         """Get the current timestep mask, defaulting to all ones."""
         mask = get_timestep_mask(self.mask_group_id)
         if mask is None:
@@ -334,7 +358,22 @@ class TLoraModule(LycorisBaseModule):
         elif mask.shape[1] < self.lora_dim:
             # Pad with ones if mask is smaller
             mask = F.pad(mask, (0, self.lora_dim - mask.shape[1]), value=1.0)
-        return mask.to(device)
+        if dtype is None:
+            dtype = self.lambda_layer.dtype
+        return mask.to(device=device, dtype=dtype)
+
+    def _rank_dropout_mask(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> Optional[torch.Tensor]:
+        """Return a (1, lora_dim) 0/1 mask for rank dropout, or None."""
+        if not (self.training and self.rank_dropout):
+            return None
+        drop = (
+            torch.rand(self.lora_dim, device=device) > self.rank_dropout
+        ).to(dtype)
+        if self.rank_dropout_scale:
+            drop = drop / drop.mean().clamp(min=torch.finfo(dtype).eps)
+        return drop.view(1, -1)
 
     @classmethod
     def make_module_from_state_dict(
@@ -428,16 +467,27 @@ class TLoraModule(LycorisBaseModule):
             "alpha": new_alpha,
         }
 
-    def get_diff_weight(self, multiplier=1.0, shape=None, device=None):
+    def get_diff_weight(
+        self,
+        multiplier=1.0,
+        shape=None,
+        device=None,
+        extra_rank_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Compute the weight difference: current - base.
 
         For T-LoRA: ΔW = P @ diag(λ*mask) @ Q - P_base @ diag(λ_base*mask) @ Q_base
+
+        ``extra_rank_mask`` is an optional (1, lora_dim) scaling applied on top
+        of the timestep mask (used for rank dropout at training time).
         """
         if device is None:
             device = self.q_layer.weight.device
 
         mask = self._get_mask(device)
+        if extra_rank_mask is not None:
+            mask = mask * extra_rank_mask.to(device=device, dtype=mask.dtype)
 
         # Current weights
         q = self.q_layer.weight.to(device)  # (lora_dim, in_dim) or conv shape
@@ -543,10 +593,13 @@ class TLoraModule(LycorisBaseModule):
         """Compute LoRA contribution in bypass mode."""
         device = x.device
         dtype = x.dtype
-        mask = self._get_mask(device)
+        mask = self._get_mask(device, dtype=dtype)
+        rank_drop = self._rank_dropout_mask(device, dtype)
+        if rank_drop is not None:
+            mask = mask * rank_drop
 
-        lam = self.lambda_layer.to(device) * mask
-        lam_base = self.base_lambda.to(device) * mask
+        lam = self.lambda_layer.to(device=device, dtype=dtype) * mask
+        lam_base = self.base_lambda.to(device=device, dtype=dtype) * mask
 
         if self.isconv:
             # Current path: x -> Q -> scale by λ -> P
@@ -585,23 +638,25 @@ class TLoraModule(LycorisBaseModule):
         if self.bypass_mode:
             return self.bypass_forward(x, scale=self.multiplier)
 
-        # Standard forward: compute full weight and apply
         base = self.org_forward(x, *args, **kwargs)
         device = x.device
 
         base_weight = self._current_weight().to(device)
-        diff_weight, _ = self.get_diff_weight(multiplier=self.multiplier, device=device)
+        rank_drop = self._rank_dropout_mask(device, base_weight.dtype)
+        diff_weight, _ = self.get_diff_weight(
+            multiplier=self.multiplier,
+            device=device,
+            extra_rank_mask=rank_drop,
+        )
         diff_weight = diff_weight.to(base_weight.dtype)
 
-        # For conv with different kernel sizes, use bypass mode logic
+        # Safety net: conv kernel-mismatch should already be handled by the
+        # forced bypass_mode in __init__, but stay defensive here too.
         if self.isconv and diff_weight.shape != base_weight.shape:
             return self.bypass_forward(x, scale=self.multiplier)
 
-        new_weight = base_weight + diff_weight
-        delta_weight = new_weight - base_weight
-
-        delta = self.op(x, delta_weight, None, **self.kw_dict)
-        return base + delta
+        delta = self.op(x, diff_weight, None, **self.kw_dict)
+        return base + self.dropout(delta)
 
     @torch.no_grad()
     def apply_max_norm(self, max_norm: float, device=None):
