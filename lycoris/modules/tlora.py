@@ -27,7 +27,12 @@ from ..logging import logger
 
 SigType = Literal["principal", "last", "middle"]
 
-# Thread-local storage for timestep mask (set by training loop)
+# Module-global storage for timestep mask (set by training loop).
+# NOTE: This is process-global, not thread-local.  It is safe for single-
+# threaded training and for DistributedDataParallel (each process has its
+# own interpreter), but NOT safe for ``nn.DataParallel`` or any setup that
+# drives multiple forward passes through this module concurrently from
+# different threads of the same process.
 _timestep_mask_storage: dict[int, torch.Tensor] = {}
 
 
@@ -89,6 +94,25 @@ def compute_timestep_mask(
 def log_tlora_init():
     return logger.info(
         "T-LoRA: Using SVD-based orthogonal initialization with timestep-dependent rank masking"
+    )
+
+
+@cache
+def log_tlora_conv_nondata_init():
+    return logger.info(
+        "T-LoRA: conv with kernel>1 uses orthogonal random init (not data SVD). "
+        "The 1x1 Q/P factorization cannot faithfully reproduce the top-rank SVD "
+        "of a kernel>1 weight, so data_init is skipped for these layers to keep "
+        "Q orthogonal at initialization."
+    )
+
+
+@cache
+def log_tlora_mask_pad():
+    return logger.warning(
+        "T-LoRA: received a timestep mask narrower than lora_dim; padding the "
+        "tail with 1.0 (i.e. extra ranks remain active). If you intended those "
+        "ranks to be masked off, pass a full-width mask."
     )
 
 
@@ -170,9 +194,39 @@ class TLoraModule(LycorisBaseModule):
                 f"(got groups={org_module.groups}). Use a different algo."
             )
 
+        # Verify that the 1x1 bypass output lines up spatially with the
+        # original conv output.  With a 1x1 down-conv at padding=0 + original
+        # stride and dilation=1, the output matches the kernel>1 conv iff
+        # ``2 * padding == dilation * (kernel - 1)`` along every spatial
+        # dimension (the "centered same-padding" condition).  Asymmetric or
+        # valid padding would yield a shape mismatch when we later add
+        # ``org_forward(x) + bypass_forward_diff(x)``.
+        if self.module_type.startswith("conv"):
+            k_size_check = org_module.kernel_size
+            pad_check = org_module.padding
+            dil_check = org_module.dilation
+            if any(k > 1 for k in k_size_check):
+                if isinstance(pad_check, str):
+                    if pad_check != "same":
+                        raise ValueError(
+                            f"T-LoRA requires same-padding for kernel>1 conv "
+                            f"(got padding={pad_check!r}) because the 1x1 "
+                            "bypass cannot match non-centered output shapes."
+                        )
+                else:
+                    for k, p, d in zip(k_size_check, pad_check, dil_check):
+                        if k > 1 and 2 * p != d * (k - 1):
+                            raise ValueError(
+                                "T-LoRA requires centered same-padding for "
+                                f"kernel>1 conv (got kernel={tuple(k_size_check)}, "
+                                f"padding={tuple(pad_check)}, "
+                                f"dilation={tuple(dil_check)}). The 1x1 bypass "
+                                "output would not match the original conv's "
+                                "spatial shape."
+                            )
+
         self.lora_dim = lora_dim
         self.sig_type = sig_type
-        self.use_data_init = use_data_init
         self.mask_group_id = mask_group_id
 
         log_tlora_init()
@@ -196,6 +250,15 @@ class TLoraModule(LycorisBaseModule):
                     "representable via bypass-style 1x1 convs."
                 )
                 self.bypass_mode = True
+
+            # For kernel>1 conv we cannot honor ``use_data_init`` truthfully:
+            # SVDing the (out, in*k*k) flattened weight and then truncating to
+            # (out, in) destroys orthogonality of the kept vectors and is not
+            # the top-rank approximation of anything meaningful.  Fall back to
+            # orthogonal random init so Q truly starts orthogonal.
+            if any(k > 1 for k in k_size) and use_data_init:
+                log_tlora_conv_nondata_init()
+                use_data_init = False
 
             # For convolutions, we work with reshaped weights
             # Original weight shape: (out_channels, in_channels, *kernel_size)
@@ -242,13 +305,29 @@ class TLoraModule(LycorisBaseModule):
         # Learnable singular values
         self.lambda_layer = nn.Parameter(torch.ones(1, lora_dim))
 
+        # Record the (possibly downgraded) init mode we actually use.
+        self.use_data_init = use_data_init
+
         # SVD-based orthogonal initialization
         self._initialize_from_svd(org_module, in_dim, out_dim, flat_in_dim)
 
-        # Store frozen base state for residual subtraction
-        self.register_buffer("base_q", self.q_layer.weight.data.clone())
-        self.register_buffer("base_p", self.p_layer.weight.data.clone())
-        self.register_buffer("base_lambda", self.lambda_layer.data.clone())
+        # Store frozen base state for residual subtraction.  These buffers are
+        # NOT persistent: they are reconstructed at load time via the same SVD
+        # init path, so writing them into the standard ``state_dict`` would
+        # only bloat checkpoints (~2x the LoRA weight size) without adding any
+        # recoverable information.  ``custom_state_dict`` bakes them into the
+        # exported standard-LoRA form, and ``make_module_from_state_dict``
+        # re-derives them from the original weight when loading legacy
+        # checkpoints.
+        self.register_buffer(
+            "base_q", self.q_layer.weight.data.clone(), persistent=False
+        )
+        self.register_buffer(
+            "base_p", self.p_layer.weight.data.clone(), persistent=False
+        )
+        self.register_buffer(
+            "base_lambda", self.lambda_layer.data.clone(), persistent=False
+        )
 
         # Alpha scaling (same as standard LoRA)
         if isinstance(alpha, torch.Tensor):
@@ -272,7 +351,10 @@ class TLoraModule(LycorisBaseModule):
     ) -> None:
         """Initialize Q and P layers using SVD."""
         if self.use_data_init:
-            # SVD of original weights (data-dependent init)
+            # SVD of original weights (data-dependent init).
+            # NOTE: For conv this path is only reachable when kernel==1 (the
+            # constructor downgrades kernel>1 conv to random init), so
+            # ``flat_in_dim == in_dim`` and there is no truncation below.
             weight = org_module.weight.data.float()
             if self.isconv:
                 # Reshape conv weight to 2D: (out_dim, in_dim * kernel_size)
@@ -280,11 +362,15 @@ class TLoraModule(LycorisBaseModule):
 
             u, s, vh = torch.linalg.svd(weight, full_matrices=False)
         else:
-            # SVD of random matrix (data-independent init)
+            # SVD of random matrix (data-independent init).  For conv we use
+            # the (out_dim, in_dim) shape — matching what the 1x1 Q/P layers
+            # can actually represent — so the resulting vh rows are truly
+            # orthonormal and Q stays orthogonal after assignment.
+            rand_in_dim = in_dim if self.isconv else flat_in_dim
             rand_weight = torch.normal(
                 mean=0,
                 std=1 / self.lora_dim,
-                size=(out_dim, flat_in_dim),
+                size=(out_dim, rand_in_dim),
             )
             u, s, vh = torch.linalg.svd(rand_weight, full_matrices=False)
 
@@ -353,7 +439,9 @@ class TLoraModule(LycorisBaseModule):
         if mask.shape[1] > self.lora_dim:
             mask = mask[:, :self.lora_dim]
         elif mask.shape[1] < self.lora_dim:
-            # Pad with ones if mask is smaller
+            # Pad with ones if mask is smaller.  Warn once: users often
+            # mistakenly expect the tail to be masked off.
+            log_tlora_mask_pad()
             mask = F.pad(mask, (0, self.lora_dim - mask.shape[1]), value=1.0)
         if dtype is None:
             dtype = self.lambda_layer.dtype
@@ -381,6 +469,8 @@ class TLoraModule(LycorisBaseModule):
         p_weight: torch.Tensor,
         lambda_weight: torch.Tensor,
         alpha: torch.Tensor,
+        sig_type: SigType = "principal",
+        use_data_init: bool = True,
     ):
         """Reconstruct module from a legacy T-LoRA state dict.
 
@@ -391,13 +481,15 @@ class TLoraModule(LycorisBaseModule):
         checkpoints saved by earlier versions that persisted
         ``q_layer`` / ``p_layer`` / ``lambda_layer`` / ``alpha``.
 
-        We must keep ``use_data_init=True``: the ``base_q``/``base_p``/
-        ``base_lambda`` buffers needed for the residual subtraction are not
-        persisted by the legacy format and have to be re-derived here via
-        SVD of the base module's original weight, matching what training
-        used.  Loading a legacy checkpoint that was trained with
-        ``use_data_init=False`` is not recoverable from the saved tensors
-        alone.
+        The ``base_q`` / ``base_p`` / ``base_lambda`` buffers needed for the
+        residual subtraction are not persisted by the legacy format, so they
+        must be re-derived from the base module's original weight.  That
+        reconstruction depends on the ``sig_type`` and ``use_data_init``
+        settings the original training used — if the caller does not pass
+        values matching training, the restored base will not match and the
+        residual subtraction will be wrong.  We expose both as kwargs and
+        default to the module defaults (``principal``/``True``), which was
+        also the prior hard-coded behavior.
         """
         lora_dim = q_weight.shape[0]
         module = cls(
@@ -406,7 +498,8 @@ class TLoraModule(LycorisBaseModule):
             multiplier=1.0,
             lora_dim=lora_dim,
             alpha=float(alpha),
-            use_data_init=True,
+            sig_type=sig_type,
+            use_data_init=use_data_init,
         )
         module.q_layer.weight.data.copy_(q_weight)
         module.p_layer.weight.data.copy_(p_weight)
