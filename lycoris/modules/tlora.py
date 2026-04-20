@@ -128,6 +128,7 @@ class TLoraModule(LycorisBaseModule):
         dropout: float = 0.0,
         rank_dropout: float = 0.0,
         module_dropout: float = 0.0,
+        use_tucker: bool = False,
         rank_dropout_scale: bool = False,
         bypass_mode: bool = None,
         sig_type: SigType = "principal",
@@ -138,20 +139,10 @@ class TLoraModule(LycorisBaseModule):
         """
         Initialize T-LoRA module.
 
-        Args:
-            lora_name: Unique name for this LoRA module
-            org_module: Original module to wrap
-            multiplier: Output multiplier
-            lora_dim: Rank of the LoRA decomposition
-            alpha: Alpha scaling factor
-            dropout: Dropout probability
-            rank_dropout: Rank-wise dropout probability
-            module_dropout: Module-level dropout probability
-            rank_dropout_scale: Whether to scale by dropout rate
-            bypass_mode: Use bypass forward mode
-            sig_type: Which singular vectors to use ("principal", "last", "middle")
-            use_data_init: If True, use SVD of original weights; if False, use random matrix
-            mask_group_id: Group ID for timestep mask lookup
+        ``use_tucker`` is accepted only to match the positional signature of
+        other LyCORIS modules (``LycorisNetwork.create_single_module`` passes
+        it positionally).  T-LoRA does not support Tucker decomposition and
+        ignores the value; a warning is logged if it is truthy.
         """
         super().__init__(
             lora_name,
@@ -166,6 +157,12 @@ class TLoraModule(LycorisBaseModule):
 
         if self.module_type not in self.support_module:
             raise ValueError(f"{self.module_type} is not supported in T-LoRA algo.")
+
+        if use_tucker:
+            logger.warning(
+                "T-LoRA does not support Tucker decomposition; "
+                "ignoring use_tucker=True."
+            )
 
         if self.module_type.startswith("conv") and org_module.groups > 1:
             raise ValueError(
@@ -385,8 +382,24 @@ class TLoraModule(LycorisBaseModule):
         lambda_weight: torch.Tensor,
         alpha: torch.Tensor,
     ):
-        """Reconstruct module from saved state dict."""
-        lora_dim = q_weight.shape[0] if q_weight.dim() == 2 else q_weight.shape[0]
+        """Reconstruct module from a legacy T-LoRA state dict.
+
+        NOTE: The current ``custom_state_dict`` emits standard LoRA keys
+        (``lora_up.weight`` / ``lora_down.weight``) for ComfyUI compatibility,
+        so newly-trained checkpoints are detected as LoCon and never reach
+        this code path.  It remains only for loading *legacy* T-LoRA
+        checkpoints saved by earlier versions that persisted
+        ``q_layer`` / ``p_layer`` / ``lambda_layer`` / ``alpha``.
+
+        We must keep ``use_data_init=True``: the ``base_q``/``base_p``/
+        ``base_lambda`` buffers needed for the residual subtraction are not
+        persisted by the legacy format and have to be re-derived here via
+        SVD of the base module's original weight, matching what training
+        used.  Loading a legacy checkpoint that was trained with
+        ``use_data_init=False`` is not recoverable from the saved tensors
+        alone.
+        """
+        lora_dim = q_weight.shape[0]
         module = cls(
             lora_name,
             orig_module,
@@ -418,6 +431,21 @@ class TLoraModule(LycorisBaseModule):
         ComfyUI apply ``scale = alpha / rank`` to standard LoRA while T-LoRA
         uses ``scale = alpha / lora_dim`` and our saved rank is ``2 * lora_dim``,
         we scale alpha by 2 so the effective strength is preserved.
+
+        IMPORTANT SAVE/LOAD ASYMMETRY
+        -----------------------------
+        Because the emitted keys are the standard LoRA keys and NOT
+        ``lambda_layer``, ``TLoraModule.algo_check`` (which looks at
+        ``weight_list_det = ["lambda_layer"]``) will *not* recognize a
+        checkpoint saved by this method as T-LoRA — it will be loaded as
+        ``LoConModule``.  This is intentional for inference-only
+        compatibility: the residual subtraction is baked into the stacked
+        weights and the timestep-masking capability is lost on export.
+
+        Consequently, ``make_module_from_state_dict`` is reached only for
+        *legacy* checkpoints produced by earlier versions that persisted the
+        raw T-LoRA keys, or for re-exporting such checkpoints with
+        ``tools/convert_tlora.py``.
         """
         with torch.no_grad():
             q = self.q_layer.weight.detach()
@@ -660,16 +688,27 @@ class TLoraModule(LycorisBaseModule):
 
     @torch.no_grad()
     def apply_max_norm(self, max_norm: float, device=None):
-        """Apply max norm regularization to weights."""
+        """Apply max norm regularization to the effective weight delta.
+
+        ``get_diff_weight`` already returns ``ΔW * self.scale`` (see line
+        where ``diff = diff * self.scale * multiplier``), so we must not
+        multiply by ``self.scale`` a second time here.
+
+        The effective delta is ``ΔW = P·diag(λ)·Q − P_base·diag(λ_base)·Q_base``.
+        To scale this uniformly by ``ratio`` we must scale BOTH ``lambda_layer``
+        and ``base_lambda`` — scaling only one side would change the subtraction
+        asymmetrically and violate the ``ratio·(curr − base)`` identity.
+        """
         diff, _ = self.get_diff_weight(multiplier=1.0, device=device)
-        orig_norm = diff.norm() * self.scale
+        orig_norm = diff.norm()
         norm = torch.clamp(orig_norm, max_norm / 2)
         desired = torch.clamp(norm, max=max_norm)
         ratio = desired.cpu() / norm.cpu()
 
         scaled = norm != desired
         if scaled:
-            # Scale the lambda layer to reduce norm
-            self.lambda_layer.data *= ratio
+            ratio_t = ratio.to(self.lambda_layer.device, self.lambda_layer.dtype)
+            self.lambda_layer.data.mul_(ratio_t)
+            self.base_lambda.mul_(ratio_t.to(self.base_lambda.dtype))
 
         return scaled, orig_norm * ratio
